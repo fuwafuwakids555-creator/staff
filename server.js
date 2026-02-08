@@ -1,161 +1,90 @@
 import express from "express";
 import fetch from "node-fetch";
+import crypto from "crypto";
 
 const app = express();
-app.use(express.json());
 
-// Render の Environment Variables に設定する
-// LINE_CHANNEL_ACCESS_TOKEN : LINEのチャネルアクセストークン（再発行したやつ）
-// GAS_API_URL              : https://script.google.com/macros/s/xxxxx/exec
-// RENDER_SECRET            : GASとRenderで同じ合言葉（長い文字列）
-
-const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const GAS_API_URL = process.env.GAS_API_URL;
-const RENDER_SECRET = process.env.RENDER_SECRET;
-
-function mustEnv(name, v) {
-  if (!v) {
-    console.error(`[ENV MISSING] ${name} is not set`);
-  }
-}
-mustEnv("LINE_CHANNEL_ACCESS_TOKEN", LINE_TOKEN);
-mustEnv("GAS_API_URL", GAS_API_URL);
-mustEnv("RENDER_SECRET", RENDER_SECRET);
-
-// ---- LINE API ----
-async function replyLine(replyToken, text) {
-  if (!replyToken) return;
-  const url = "https://api.line.me/v2/bot/message/reply";
-  const payload = {
-    replyToken,
-    messages: [{ type: "text", text: String(text) }],
-  };
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${LINE_TOKEN}`,
+// LINE署名検証用：生のBodyが必要
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
     },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    console.error("replyLine failed", res.status, await res.text());
+  })
+);
+
+const GAS_API_URL = process.env.GAS_API_URL;               // ←ここが undefined だと落ちる
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
+
+function requireEnv(name, val) {
+  if (!val || String(val).trim() === "") {
+    throw new Error(`Missing env: ${name}`);
   }
+  return String(val).trim();
 }
 
-async function getProfile(userId) {
+function validateUrl(name, url) {
   try {
-    const res = await fetch(`https://api.line.me/v2/bot/profile/${encodeURIComponent(userId)}`, {
-      headers: { Authorization: `Bearer ${LINE_TOKEN}` },
-    });
-    if (!res.ok) return {};
-    return await res.json();
-  } catch (e) {
-    return {};
+    new URL(url);
+    return url;
+  } catch {
+    throw new Error(`Invalid URL in env ${name}: ${url}`);
   }
 }
 
-// ---- GAS 呼び出し ----
-async function callGas(payload) {
-  const res = await fetch(GAS_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...payload, secret: RENDER_SECRET }),
-  });
-  const text = await res.text();
-  return { status: res.status, text };
+// 起動時にチェック（ここで原因が即わかる）
+const GAS_URL = validateUrl("GAS_API_URL", requireEnv("GAS_API_URL", GAS_API_URL));
+requireEnv("LINE_CHANNEL_SECRET", LINE_CHANNEL_SECRET);
+
+function verifyLineSignature(req) {
+  const signature = req.get("x-line-signature");
+  if (!signature) return false;
+
+  const hash = crypto
+    .createHmac("SHA256", LINE_CHANNEL_SECRET)
+    .update(req.rawBody)
+    .digest("base64");
+
+  return hash === signature;
 }
 
-// userId から staffId を引く（GAS側 whoami）
-async function whoami(userId) {
-  const r = await callGas({ action: "whoami", userId });
-  if (r.status !== 200) return "";
-  // GASは staffId だけ返す仕様（未登録なら空）
-  return String(r.text || "").trim();
-}
-
-app.get("/", (req, res) => res.status(200).send("OK"));
+app.get("/", (req, res) => {
+  res.status(200).send("OK");
+});
 
 app.post("/webhook", async (req, res) => {
-  // LINE側に再送されないために、どんな場合でも200を返す
   try {
-    const body = req.body;
-    console.log("LINE Webhook:", JSON.stringify(body));
+    // 署名チェック（LINEからの本物だけ通す）
+    if (!verifyLineSignature(req)) {
+      return res.status(401).send("Invalid signature");
+    }
 
-    if (!body || !body.events || body.events.length === 0) {
+    console.log("LINE Webhook:", JSON.stringify(req.body, null, 2));
+
+    // events が空のことは普通にある（検証ボタン等）
+    const events = req.body?.events || [];
+    if (events.length === 0) {
       return res.status(200).send("OK");
     }
 
-    for (const ev of body.events) {
-      // 友だち追加
-      if (ev.type === "follow") {
-        await replyLine(ev.replyToken, "登録のため、3桁のスタッフコード（例：001）を送ってください。");
-        continue;
-      }
+    // GASへ丸投げ（GAS側 doPost が受ける）
+    const r = await fetch(GAS_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req.body),
+    });
 
-      // テキスト以外は無視
-      if (ev.type !== "message" || !ev.message || ev.message.type !== "text") continue;
-
-      const userId = ev.source?.userId;
-      const text = String(ev.message.text || "").trim();
-      if (!userId) continue;
-
-      // プロフィール名（取れなくてもOK）
-      const profile = await getProfile(userId);
-      const lineName = profile.displayName || "";
-
-      // ① まだ紐付けが無いなら、まず staffId を探す
-      let staffId = await whoami(userId);
-
-      // ② 紐付け前：3桁コードならリンク
-      if (!staffId) {
-        if (/^\d{3}$/.test(text)) {
-          const r = await callGas({
-            action: "link",
-            staffId: text,
-            userId,
-            lineName,
-          });
-
-          if (String(r.text).includes("OK")) {
-            await replyLine(
-              ev.replyToken,
-              `スタッフコード「${text}」で登録しました。\n今後このLINEで個別連絡します。\nメッセージを送ると管理者に届きます。`
-            );
-          } else {
-            await replyLine(
-              ev.replyToken,
-              `スタッフコード「${text}」が見つかりませんでした。\nもう一度3桁コードを送ってください。`
-            );
-          }
-          continue;
-        } else {
-          await replyLine(ev.replyToken, "最初に3桁のスタッフコード（例：001）を送ってください。");
-          continue;
-        }
-      }
-
-      // ③ 紐付け済み：チャットとしてGASへ保存
-      const chatRes = await callGas({
-        action: "chat",
-        staffId,
-        senderName: lineName || "スタッフ",
-        message: text,
-      });
-
-      if (!String(chatRes.text).includes("OK")) {
-        console.error("chat save failed", chatRes.status, chatRes.text);
-      }
-
-      await replyLine(ev.replyToken, "受け付けました！管理者が確認します。");
-    }
+    const text = await r.text();
+    console.log("GAS response:", r.status, text);
 
     return res.status(200).send("OK");
   } catch (err) {
-    console.error("webhook error", err);
-    return res.status(200).send("OK");
+    console.error("webhook error:", err);
+    return res.status(200).send("OK"); // LINEには200返し（再送爆発防止）
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running on port", PORT));
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
+});
